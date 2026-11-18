@@ -24,6 +24,15 @@ services:
       # The web console sends its real test datagrams back to the listener.
       DHCP_SIM_TARGET_HOST: "127.0.0.1"
       DHCP_SIM_TARGET_PORT: "6767"
+      # Directed probe window.
+      DHCP_PROBE_TIMEOUT: "3"
+      # Seed the trust registry. Format: name|host|port|trusted|server-id;...
+      # Hosts use 127.0.0.1 because every service publishes its UDP port there.
+      DHCP_PROBE_SEED_ENDPOINTS: >-
+        受信本地服务|127.0.0.1|6767|1|192.0.2.2;
+        陌生应答-冒名|127.0.0.1|6768|0|;
+        陌生应答-迟到|127.0.0.1|6769|0|;
+        陌生应答-错事务号|127.0.0.1|6770|0|
       # Set to "1" to enable the web-only drill endpoint that makes the next
       # lease commit fail, demonstrating that no ACK is sent without durability.
       DHCP_ALLOW_FAILURE_INJECTION: "1"
@@ -38,6 +47,61 @@ services:
       timeout: 3s
       retries: 4
       start_period: 5s
+
+  # Unauthorised responder that copies the trusted Server Identifier. It is
+  # still judged from its network endpoint, so the verdict is "spoofed".
+  rogue-spoof:
+    build: .
+    image: isolated-dhcp-lab:latest
+    container_name: isolated-dhcp-rogue-spoof
+    restart: unless-stopped
+    command: ["python", "-m", "app.rogue.server"]
+    environment:
+      ROGUE_UDP_PORT: "6768"
+      ROGUE_SERVER_ID: "192.0.2.2"
+      ROGUE_OFFER_IP: "198.51.100.230"
+      ROGUE_ROUTER: "198.51.100.1"
+      ROGUE_DNS: "198.51.100.1"
+      ROGUE_DELAY_SECONDS: "0"
+    ports:
+      - "6768:6768/udp"
+
+  # Unauthorised responder that answers only after the probe window closes.
+  # Its late OFFER must never appear in the round that follows.
+  rogue-late:
+    build: .
+    image: isolated-dhcp-lab:latest
+    container_name: isolated-dhcp-rogue-late
+    restart: unless-stopped
+    command: ["python", "-m", "app.rogue.server"]
+    environment:
+      ROGUE_UDP_PORT: "6769"
+      ROGUE_SERVER_ID: "198.51.100.2"
+      ROGUE_OFFER_IP: "198.51.100.231"
+      ROGUE_ROUTER: "198.51.100.1"
+      ROGUE_DNS: "198.51.100.1"
+      ROGUE_DELAY_SECONDS: "6"
+    ports:
+      - "6769:6769/udp"
+
+  # Unauthorised responder that answers with a wrong xid, demonstrating the
+  # transaction/identity guard: the datagram is kept as mismatch evidence, not
+  # counted as an answer.
+  rogue-bad-xid:
+    build: .
+    image: isolated-dhcp-lab:latest
+    container_name: isolated-dhcp-rogue-bad-xid
+    restart: unless-stopped
+    command: ["python", "-m", "app.rogue.server"]
+    environment:
+      ROGUE_UDP_PORT: "6770"
+      ROGUE_SERVER_ID: "198.51.100.2"
+      ROGUE_OFFER_IP: "198.51.100.232"
+      ROGUE_ROUTER: "198.51.100.1"
+      ROGUE_DNS: "198.51.100.1"
+      ROGUE_REPLY_BAD_XID: "1"
+    ports:
+      - "6770:6770/udp"
 
 volumes:
   dhcp-data:

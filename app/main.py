@@ -26,6 +26,7 @@ from .dhcp.packet import (
     build_packet,
     parse_packet,
 )
+from .dhcp.probe import ProbeManager
 from .dhcp.server import DhcpService, UdpDhcpServer
 from .dhcp.store import LeaseStore
 
@@ -94,6 +95,29 @@ class SimResponse(BaseModel):
     note: str
 
 
+class EndpointBody(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(ge=1, le=65535)
+    trusted: bool = False
+    expected_server_id: str | None = None
+    note: str | None = Field(default=None, max_length=255)
+
+    @field_validator("expected_server_id")
+    @classmethod
+    def _server_id(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        try:
+            return str(ipaddress.IPv4Address(value.strip()))
+        except ValueError as exc:
+            raise ValueError(f"expected_server_id is not IPv4: {value}") from exc
+
+
+class ProbeStartBody(BaseModel):
+    endpoint_ids: list[int] = Field(min_length=1, max_length=32)
+
+
 def _parse_ip(value: str | None, field: str):
     if not value:
         return None
@@ -101,6 +125,43 @@ def _parse_ip(value: str | None, field: str):
         return ipaddress.IPv4Address(value)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=f"{field} is not IPv4: {value}") from exc
+
+
+def _seed_endpoints(settings: Settings, store: LeaseStore) -> None:
+    """Register the trust list declared via DHCP_PROBE_SEED_ENDPOINTS once."""
+    if not settings.probe_seed_endpoints.strip():
+        return
+    existing = {row["name"] for row in store.list_endpoints()}
+    # Format: name|host|port|trusted(0/1)|server-id(optional);...
+    for chunk in settings.probe_seed_endpoints.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [part.strip() for part in chunk.split("|")]
+        if len(parts) < 4:
+            log.warning("ignoring malformed probe seed entry: %r", chunk)
+            continue
+        name, host, port_raw, trusted_raw = parts[:4]
+        server_id = parts[4] if len(parts) > 4 and parts[4] else None
+        if name in existing:
+            continue
+        try:
+            port = int(port_raw)
+            trusted = trusted_raw in ("1", "true", "yes", "on")
+            if not 1 <= port <= 65535:
+                raise ValueError("port out of range")
+            if server_id:
+                ipaddress.IPv4Address(server_id)
+        except ValueError:
+            log.warning("ignoring malformed probe seed entry: %r", chunk)
+            continue
+        try:
+            store.create_endpoint(
+                name=name, host=host, port=port, trusted=trusted,
+                expected_server_id=server_id, note="compose 种子登记",
+            )
+        except ValueError:
+            continue
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -117,14 +178,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service = DhcpService(settings, store)
         notifier = _Notifier()
         udp = UdpDhcpServer(service, on_change=notifier.bump)
+        probes = ProbeManager(settings, store)
         try:
             await udp.start()
         except OSError:
             store.close()
             raise
+        _seed_endpoints(settings, store)
         state.update(
             settings=settings, store=store, service=service, udp=udp,
-            notifier=notifier,
+            notifier=notifier, probes=probes,
         )
         log.info(
             "DHCP lab listening on udp/%s, pool %s-%s, web on http://0.0.0.0:8080",
@@ -135,6 +198,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            await probes.shutdown()
             udp.close()
             store.close()
 
@@ -185,6 +249,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "sim_target": {
                 "host": settings_obj.sim_target_host,
                 "port": settings_obj.sim_target_port,
+            },
+            "probe": {
+                "timeout": settings_obj.probe_timeout,
+                "mac_oui": settings_obj.probe_mac_oui,
+                "endpoints": store.list_endpoints(),
+                "rounds": store.list_probe_rounds(10),
             },
             "version": notifier.version,
         }
@@ -325,6 +395,110 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             action=(outcome or {}).get("message_type_name") if outcome else None,
             note=note,
         )
+
+    # -- directed rogue-DHCP probe ----------------------------------------
+
+    def _get_probe_manager() -> ProbeManager:
+        if "probes" not in state:
+            raise HTTPException(status_code=503, detail="server is starting")
+        return state["probes"]  # type: ignore[return-value]
+
+    @app.get("/api/probe/endpoints")
+    async def probe_list_endpoints():
+        _settings, store, _service, _notifier = deps()
+        return {"endpoints": store.list_endpoints()}
+
+    @app.post("/api/probe/endpoints", status_code=201)
+    async def probe_create_endpoint(body: EndpointBody):
+        _settings, store, _service, _notifier = deps()
+        try:
+            endpoint = store.create_endpoint(
+                name=body.name,
+                host=body.host,
+                port=body.port,
+                trusted=body.trusted,
+                expected_server_id=body.expected_server_id,
+                note=body.note,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return endpoint
+
+    @app.put("/api/probe/endpoints/{endpoint_id}")
+    async def probe_update_endpoint(endpoint_id: int, body: EndpointBody):
+        _settings, store, _service, _notifier = deps()
+        try:
+            return store.update_endpoint(
+                endpoint_id,
+                name=body.name,
+                host=body.host,
+                port=body.port,
+                trusted=body.trusted,
+                expected_server_id=body.expected_server_id,
+                note=body.note,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="endpoint not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.delete("/api/probe/endpoints/{endpoint_id}", status_code=204)
+    async def probe_delete_endpoint(endpoint_id: int):
+        _settings, store, _service, _notifier = deps()
+        try:
+            store.delete_endpoint(endpoint_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="endpoint not found") from exc
+        return JSONResponse(status_code=204, content=None)
+
+    @app.post("/api/probe/rounds", status_code=201)
+    async def probe_start_round(body: ProbeStartBody):
+        _settings, store, _service, notifier = deps()
+        manager = _get_probe_manager()
+        endpoints: list[dict] = []
+        peers: set[tuple[str, int]] = set()
+        for endpoint_id in dict.fromkeys(body.endpoint_ids):  # de-duplicate, keep order
+            endpoint = store.get_endpoint(endpoint_id)
+            if endpoint is None:
+                raise HTTPException(
+                    status_code=404, detail=f"endpoint {endpoint_id} not registered"
+                )
+            peer = (str(endpoint["host"]), int(endpoint["port"]))
+            if peer in peers:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"duplicate endpoint peer {peer[0]}:{peer[1]} in one round; "
+                    "a reply can only be attributed to one target",
+                )
+            peers.add(peer)
+            endpoints.append(endpoint)
+        detail = await manager.start_round(endpoints)
+        notifier.bump()
+        return detail
+
+    @app.get("/api/probe/rounds")
+    async def probe_list_rounds(limit: int = Query(default=20, ge=1, le=100)):
+        _settings, store, _service, _notifier = deps()
+        return {"rounds": store.list_probe_rounds(limit)}
+
+    @app.get("/api/probe/rounds/{round_id}")
+    async def probe_get_round(round_id: int):
+        _settings, store, _service, _notifier = deps()
+        detail = store.get_probe_round_detail(round_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="probe round not found")
+        return detail
+
+    @app.post("/api/probe/rounds/{round_id}/cancel")
+    async def probe_cancel_round(round_id: int):
+        _settings, store, _service, notifier = deps()
+        manager = _get_probe_manager()
+        try:
+            detail = await manager.cancel_round(round_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="probe round not found") from exc
+        notifier.bump()
+        return detail
 
     static_dir = settings.static_dir
     app.mount("/static", StaticFiles(directory=static_dir), name="static")

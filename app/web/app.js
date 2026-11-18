@@ -16,6 +16,31 @@ const ACTION_LABEL = {
   DHCPNAK: "已返回 NAK（地址不可用）",
 };
 
+const VERDICT_LABEL = {
+  trusted: "受信应答",
+  rogue: "非授权应答",
+  "spoofed-identifier": "冒用受信标识（仍属非授权）",
+  "identity-mismatch": "身份/事务号不符（未采信）",
+  malformed: "报文无法解析",
+  "unexpected-message-type": "非 OFFER 报文",
+  unverified: "未核实（无有效应答）",
+};
+
+const TARGET_STATE_LABEL = {
+  pending: "等待应答",
+  answered: "已收到应答",
+  timeout: "超时",
+  unverified: "未核实",
+  error: "端点不可达",
+};
+
+const ROUND_STATUS_LABEL = {
+  running: "进行中",
+  completed: "已完成",
+  cancelled: "已取消",
+  timeout: "等待窗口结束",
+};
+
 function setHealth(ok, text) {
   const el = $("health");
   el.textContent = text;
@@ -116,10 +141,217 @@ async function refresh() {
     renderPool(state);
     renderLeases(state.leases);
     renderEvents(state.events);
+    renderProbe(state.probe);
   } catch (err) {
     setHealth(false, "服务不可达: " + err.message);
   }
 }
+
+// -- directed probe -------------------------------------------------------
+
+function renderProbe(probe) {
+  if (!probe) return;
+  const endpoints = probe.endpoints || [];
+  const checked = new Set(
+    Array.from(document.querySelectorAll(".probe-ep:checked")).map((el) => el.value)
+  );
+  if (!endpoints.length) {
+    $("probe-endpoints").innerHTML =
+      `<span class="empty">尚未登记端点；在下方表单登记，或使用 Compose 种子自动登记。</span>`;
+  } else {
+    $("probe-endpoints").innerHTML = endpoints.map((ep) => `
+      <label class="endpoint-row">
+        <input type="checkbox" class="probe-ep" value="${ep.id}" ${checked.has(String(ep.id)) ? "checked" : ""}>
+        <span class="ep-name">${esc(ep.name)}</span>
+        <span class="verdict ${ep.trusted ? "trusted" : "rogue"}">${ep.trusted ? "受信" : "非受信"}</span>
+        <span class="ep-addr">${esc(ep.host)}:${ep.port}</span>
+        <span class="ep-addr">SID: ${esc(ep.expected_server_id || "—")}</span>
+        <button type="button" class="ghost probe-del" data-id="${ep.id}" style="padding:3px 10px">删除</button>
+        <span class="ep-note">${esc(ep.note || "")}</span>
+      </label>`).join("");
+  }
+  const rounds = probe.rounds || [];
+  $("probe-round-count").textContent = `${rounds.length} 轮（最近）`;
+  renderRoundSummaries(rounds);
+  if (rounds.some((r) => r.status === "running")) {
+    // Keep evidence updating while a round is in flight.
+    setTimeout(refreshRunningRound, 700);
+  }
+}
+
+function renderRoundSummaries(rounds) {
+  if (!rounds.length) {
+    $("probe-rounds").innerHTML = `<p class="empty">还没有探测轮次。</p>`;
+    return;
+  }
+  $("probe-rounds").innerHTML = rounds
+    .map((r) => `<div class="round-block ${esc(r.status)}" data-round="${r.id}">
+      <div class="round-head">
+        <span>轮次 <b>#${r.id}</b></span>
+        <span>状态 <span class="verdict ${esc(r.status)}">${esc(ROUND_STATUS_LABEL[r.status] || r.status)}</span></span>
+        <span>XID <b>${esc(r.xid)}</b></span>
+        <span>探测身份 <b>${esc(r.mac)}</b></span>
+        <span>创建 <b>${esc(r.created_at)}</b></span>
+        <span>${esc(r.reason || "")}</span>
+        <span class="round-detail-slot">${
+          r.status === "running"
+            ? `<button type="button" class="danger probe-cancel" data-round="${r.id}" style="padding:4px 12px">取消本轮</button>`
+            : ""
+        }</span>
+      </div>
+      <div class="round-evidence-slot"><span class="empty">证据加载中…</span></div>
+    </div>`)
+    .join("");
+  rounds.forEach((r) => loadRoundDetail(r.id));
+}
+
+async function loadRoundDetail(roundId) {
+  try {
+    const res = await fetch(`/api/probe/rounds/${roundId}`, { cache: "no-store" });
+    if (!res.ok) return;
+    const detail = await res.json();
+    const block = document.querySelector(`.round-block[data-round="${roundId}"]`);
+    if (!block) return;
+    block.querySelector(".round-evidence-slot").innerHTML = renderEvidence(detail);
+  } catch (_) {
+    /* refreshed on next poll */
+  }
+}
+
+function renderEvidence(detail) {
+  const rows = [];
+  for (const target of detail.targets) {
+    if (!target.replies.length) {
+      rows.push(`<tr>
+        <td>${esc(target.name)}<br><span class="ep-addr">${esc(target.host)}:${target.port}</span></td>
+        <td><span class="verdict ${esc(target.state)}">${esc(TARGET_STATE_LABEL[target.state] || target.state)}</span></td>
+        <td>—</td><td>—</td><td>—</td><td>—</td>
+        <td class="detail">${target.state === "unverified" ? "窗口内未取得与本轮 XID/身份匹配的应答" : "等待应答或端点不可达"}</td>
+      </tr>`);
+      continue;
+    }
+    for (const reply of target.replies) {
+      rows.push(`<tr>
+        <td>${esc(target.name)}<br><span class="ep-addr">${esc(reply.source)}</span></td>
+        <td><span class="verdict ${esc(reply.verdict)}">${esc(VERDICT_LABEL[reply.verdict] || reply.verdict)}</span></td>
+        <td>${esc(reply.message_type || "—")}</td>
+        <td>${esc(reply.server_id || "—")}</td>
+        <td>${esc(reply.yiaddr || "—")}</td>
+        <td>${esc(reply.router || "—")}</td>
+        <td class="detail">${esc(reply.reason)}</td>
+      </tr>`);
+    }
+  }
+  const withdrawn = detail.targets.flatMap((t) => t.withdrawn_ips || []);
+  const cleanup = withdrawn.length
+    ? `<p class="hint">本轮结束后已撤销本服务 OFFER 预留：${esc([...new Set(withdrawn)].join(", "))}（bound 租约未触碰）</p>`
+    : "";
+  return `${cleanup}
+    <div class="table-wrap"><table>
+      <thead><tr><th>应答来源</th><th>判定</th><th>报文</th><th>Server ID</th><th>拟分配地址</th><th>网关</th><th>判定依据</th></tr></thead>
+      <tbody>${rows.join("")}</tbody>
+    </table></div>`;
+}
+
+async function refreshRunningRound() {
+  const running = document.querySelector(".round-block.running");
+  if (!running) return;
+  await loadRoundDetail(Number(running.dataset.round));
+  const stillRunning = document.querySelector(".round-block.running");
+  if (stillRunning) setTimeout(refreshRunningRound, 700);
+  else refresh();
+}
+
+async function apiJson(url, options = {}) {
+  const res = await fetch(url, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`);
+  return data;
+}
+
+$("probe-endpoints").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".probe-del");
+  if (!btn) return;
+  if (!confirm("删除该端点登记？")) return;
+  try {
+    const res = await fetch(`/api/probe/endpoints/${btn.dataset.id}`, { method: "DELETE" });
+    if (!res.ok && res.status !== 204) throw new Error(`HTTP ${res.status}`);
+    $("probe-status").textContent = "端点已删除";
+    refresh();
+  } catch (err) {
+    $("probe-status").textContent = "删除失败: " + err.message;
+  }
+});
+
+$("probe-endpoint-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = {
+    name: $("ep-name").value.trim(),
+    host: $("ep-host").value.trim(),
+    port: Number($("ep-port").value.trim()),
+    expected_server_id: $("ep-sid").value.trim() || null,
+    trusted: $("ep-trusted").checked,
+    note: $("ep-note").value.trim() || null,
+  };
+  try {
+    await apiJson("/api/probe/endpoints", { method: "POST", body: JSON.stringify(body) });
+    $("probe-status").textContent = `已登记端点 ${body.name}`;
+    e.target.reset();
+    refresh();
+  } catch (err) {
+    $("probe-status").textContent = "登记失败: " + err.message;
+  }
+});
+
+$("probe-select-trusted").addEventListener("click", () => {
+  document.querySelectorAll(".probe-ep").forEach((el) => {
+    const row = el.closest(".endpoint-row");
+    el.checked = row.querySelector(".verdict.trusted") !== null;
+  });
+});
+$("probe-select-all").addEventListener("click", () => {
+  document.querySelectorAll(".probe-ep").forEach((el) => { el.checked = true; });
+});
+
+$("probe-start").addEventListener("click", async () => {
+  const ids = Array.from(document.querySelectorAll(".probe-ep:checked")).map((el) => Number(el.value));
+  if (!ids.length) {
+    $("probe-status").textContent = "请先勾选至少一个端点";
+    return;
+  }
+  const btn = $("probe-start");
+  btn.disabled = true;
+  $("probe-status").textContent = "探测进行中（真实 DISCOVER 已发出）…";
+  try {
+    const detail = await apiJson("/api/probe/rounds", {
+      method: "POST",
+      body: JSON.stringify({ endpoint_ids: ids }),
+    });
+    $("probe-status").textContent = `第 #${detail.id} 轮已发起，XID ${detail.xid}，窗口 ${detail.timeout}s`;
+    refresh();
+  } catch (err) {
+    $("probe-status").textContent = "发起失败: " + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("probe-rounds").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".probe-cancel");
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    await apiJson(`/api/probe/rounds/${btn.dataset.round}/cancel`, { method: "POST" });
+    $("probe-status").textContent = "已取消；已收证据保留，未应答端点标记为未核实";
+    refresh();
+  } catch (err) {
+    $("probe-status").textContent = "取消失败: " + err.message;
+    btn.disabled = false;
+  }
+});
 
 async function longPoll() {
   try {

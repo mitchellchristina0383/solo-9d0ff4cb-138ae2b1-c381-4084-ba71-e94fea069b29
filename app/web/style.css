@@ -59,8 +59,10 @@ main {
 @media (min-width: 980px) {
   main { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   #overview, #sim-form, section:nth-of-type(2) { grid-column: span 1; }
-  section:nth-of-type(2) { grid-column: span 2; }
-  section:nth-of-type(3), section:nth-of-type(4) { grid-column: span 2; }
+  section:nth-of-type(2), #probe-card { grid-column: span 2; }
+  section:nth-of-type(3), section:nth-of-type(4), section:nth-of-type(5) {
+    grid-column: span 2;
+  }
 }
 
 .card {
@@ -174,6 +176,38 @@ td.detail { white-space: normal; max-width: 360px; color: var(--muted); }
 .tag.offered { color: var(--warn); border-color: #6b5315; }
 .tag.bound { color: var(--ok); border-color: #24512f; }
 .tag.declined { color: var(--bad); border-color: #5a2626; }
+
+/* Directed probe console */
+.endpoint-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.endpoint-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #10161d;
+  font-size: 12px;
+}
+.endpoint-row input[type="checkbox"] { accent-color: var(--accent); }
+.endpoint-row .ep-name { font-weight: 600; min-width: 130px; }
+.endpoint-row .ep-addr { color: var(--muted); }
+.endpoint-row .ep-note { color: var(--muted); font-size: 11px; margin-left: auto; }
+.verdict { padding: 1px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); white-space: nowrap; }
+.verdict.trusted { color: var(--ok); border-color: #24512f; background: #0f1d13; }
+.verdict.rogue, .verdict.spoofed-identifier { color: var(--bad); border-color: #5a2626; background: #211012; }
+.verdict.identity-mismatch, .verdict.malformed, .verdict.unexpected-message-type {
+  color: var(--warn); border-color: #6b5315; background: #201a0c;
+}
+.verdict.unverified, .verdict.pending { color: var(--muted); }
+.round-head { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.round-head b { color: var(--text); font-weight: 500; }
+.round-block { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; background: #10161d; }
+.round-block.running { border-color: #244059; }
+.evidence td.detail { max-width: 420px; }
+.inline-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; margin-top: 12px; }
+.inline-form label { min-width: 150px; }
+button.danger { background: transparent; color: var(--bad); border: 1px solid #5a2626; }
 
 .empty { color: var(--muted); font-style: italic; }
 

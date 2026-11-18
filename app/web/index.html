@@ -81,6 +81,38 @@
     <pre id="sim-result" class="result hidden"></pre>
   </section>
 
+  <section class="card" id="probe-card">
+    <h2>定向探测：核查非授权 DHCP 应答 <span id="probe-round-count" class="badge"></span></h2>
+    <p class="hint">
+      对登记端点发送真实 DISCOVER（每轮生成独立事务号 XID 与探测设备身份），
+      仅收<strong>本轮 XID + 本设备身份</strong>且来自对应 UDP 端点的应答；
+      可信度按<strong>应答来源端点</strong>判定——陌生端点即使冒用受信 Server Identifier 也判为冒用，
+      不算受信。探测不发 REQUEST、不确认租约；轮次结束/取消后撤销本轮在本服务产生的 OFFER 预留，
+      真实设备的 bound 租约不会被触碰，迟到应答不会混入下一轮。
+    </p>
+
+    <h3 style="font-size:13px;color:var(--muted);margin:14px 0 8px">受信 / 待核查 UDP 端点</h3>
+    <div id="probe-endpoints" class="endpoint-list">加载中…</div>
+    <form id="probe-endpoint-form" class="inline-form">
+      <label>名称 <input name="name" id="ep-name" placeholder="陌生应答-机房B" required></label>
+      <label>主机 <input name="host" id="ep-host" placeholder="127.0.0.1" required></label>
+      <label>端口 <input name="port" id="ep-port" placeholder="6768" inputmode="numeric" required></label>
+      <label>登记 Server Identifier（可选） <input name="expected_server_id" id="ep-sid" placeholder="192.0.2.2"></label>
+      <label class="check"><input type="checkbox" name="trusted" id="ep-trusted"> 受信端点</label>
+      <label>备注（可选） <input name="note" id="ep-note" placeholder="现场登记"></label>
+      <button type="submit">登记端点</button>
+    </form>
+
+    <div class="actions">
+      <button type="button" id="probe-start">对勾选端点发起探测</button>
+      <button type="button" class="ghost" id="probe-select-trusted">全选受信</button>
+      <button type="button" class="ghost" id="probe-select-all">全选</button>
+      <span id="probe-status" class="status"></span>
+    </div>
+
+    <div id="probe-rounds" style="margin-top:16px"></div>
+  </section>
+
   <section class="card">
     <h2>当前预留与租约 <span id="lease-count" class="badge"></span></h2>
     <p class="hint">OFFER 有效期内的地址会占用池资源，其他设备无法领取；RELEASE 或过期后回收。</p>

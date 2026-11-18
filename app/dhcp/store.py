@@ -54,6 +54,61 @@ CREATE TABLE IF NOT EXISTS events (
     detail TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_at ON events(at);
+-- Directed rogue-DHCP probe registry and evidence trail.
+CREATE TABLE IF NOT EXISTS probe_endpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+    trusted INTEGER NOT NULL CHECK (trusted IN (0, 1)),
+    expected_server_id TEXT,
+    note TEXT,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS probe_rounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    xid INTEGER NOT NULL,
+    mac TEXT NOT NULL,
+    client_key TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'cancelled', 'timeout')),
+    reason TEXT,
+    timeout REAL NOT NULL,
+    created_at REAL NOT NULL,
+    finished_at REAL
+);
+CREATE INDEX IF NOT EXISTS probe_rounds_created ON probe_rounds(created_at);
+CREATE TABLE IF NOT EXISTS probe_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id INTEGER NOT NULL REFERENCES probe_rounds(id),
+    endpoint_id INTEGER NOT NULL REFERENCES probe_endpoints(id),
+    name TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    trusted INTEGER NOT NULL,
+    expected_server_id TEXT,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'timeout', 'unverified', 'error')),
+    withdrawn_ips TEXT
+);
+CREATE INDEX IF NOT EXISTS probe_targets_round ON probe_targets(round_id);
+CREATE TABLE IF NOT EXISTS probe_replies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id INTEGER NOT NULL REFERENCES probe_targets(id),
+    round_id INTEGER NOT NULL REFERENCES probe_rounds(id),
+    at REAL NOT NULL,
+    source_host TEXT NOT NULL,
+    source_port INTEGER NOT NULL,
+    xid INTEGER,
+    chaddr TEXT,
+    message_type TEXT,
+    server_id TEXT,
+    yiaddr TEXT,
+    router TEXT,
+    verdict TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    packet_hex TEXT NOT NULL,
+    parse_error TEXT
+);
+CREATE INDEX IF NOT EXISTS probe_replies_round ON probe_replies(round_id);
 """
 
 
@@ -764,3 +819,324 @@ class LeaseStore:
 
     def new_xid(self) -> int:
         return uuid.uuid4().int & 0xFFFFFFFF
+
+    # -- directed probe registry / evidence --------------------------------
+
+    @staticmethod
+    def _endpoint_row(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "host": row["host"],
+            "port": row["port"],
+            "trusted": bool(row["trusted"]),
+            "expected_server_id": row["expected_server_id"],
+            "note": row["note"],
+            "created_at": iso(row["created_at"]),
+        }
+
+    def create_endpoint(
+        self,
+        *,
+        name: str,
+        host: str,
+        port: int,
+        trusted: bool,
+        expected_server_id: str | None,
+        note: str | None,
+    ) -> dict:
+        now = self._clock()
+        with self._transaction() as conn:
+            try:
+                cur = conn.execute(
+                    "INSERT INTO probe_endpoints(name, host, port, trusted, "
+                    "expected_server_id, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (name, host, port, 1 if trusted else 0, expected_server_id, note, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"endpoint name already registered: {name}") from exc
+            row = conn.execute(
+                "SELECT * FROM probe_endpoints WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+        return self._endpoint_row(row)
+
+    def list_endpoints(self) -> list[dict]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM probe_endpoints ORDER BY trusted DESC, id"
+                ).fetchall()
+            finally:
+                conn.close()
+        return [self._endpoint_row(row) for row in rows]
+
+    def get_endpoint(self, endpoint_id: int) -> dict | None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT * FROM probe_endpoints WHERE id = ?", (endpoint_id,)
+                ).fetchone()
+            finally:
+                conn.close()
+        return self._endpoint_row(row) if row else None
+
+    def update_endpoint(
+        self,
+        endpoint_id: int,
+        *,
+        name: str,
+        host: str,
+        port: int,
+        trusted: bool,
+        expected_server_id: str | None,
+        note: str | None,
+    ) -> dict:
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM probe_endpoints WHERE id = ?", (endpoint_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(endpoint_id)
+            try:
+                conn.execute(
+                    "UPDATE probe_endpoints SET name = ?, host = ?, port = ?, "
+                    "trusted = ?, expected_server_id = ?, note = ? WHERE id = ?",
+                    (name, host, port, 1 if trusted else 0,
+                     expected_server_id, note, endpoint_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"endpoint name already registered: {name}") from exc
+            row = conn.execute(
+                "SELECT * FROM probe_endpoints WHERE id = ?", (endpoint_id,)
+            ).fetchone()
+        return self._endpoint_row(row)
+
+    def delete_endpoint(self, endpoint_id: int) -> None:
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT id FROM probe_endpoints WHERE id = ?", (endpoint_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(endpoint_id)
+            conn.execute("DELETE FROM probe_endpoints WHERE id = ?", (endpoint_id,))
+
+    def create_probe_round(
+        self, *, xid: int, mac: str, client_key: str, timeout: float
+    ) -> int:
+        now = self._clock()
+        with self._transaction() as conn:
+            cur = conn.execute(
+                "INSERT INTO probe_rounds(xid, mac, client_key, status, timeout, "
+                "created_at) VALUES (?, ?, ?, 'running', ?, ?)",
+                (xid, mac, client_key, timeout, now),
+            )
+            return int(cur.lastrowid)
+
+    def create_probe_target(
+        self, *, round_id: int, endpoint: dict
+    ) -> int:
+        with self._transaction() as conn:
+            cur = conn.execute(
+                "INSERT INTO probe_targets(round_id, endpoint_id, name, host, port, "
+                "trusted, expected_server_id, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+                (
+                    round_id,
+                    endpoint["id"],
+                    endpoint["name"],
+                    endpoint["host"],
+                    endpoint["port"],
+                    1 if endpoint["trusted"] else 0,
+                    endpoint["expected_server_id"],
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def update_probe_target(
+        self, target_id: int, *, state: str, withdrawn_ips: list[str] | None = None
+    ) -> None:
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE probe_targets SET state = ?, withdrawn_ips = ? WHERE id = ?",
+                (state, json.dumps(withdrawn_ips) if withdrawn_ips is not None else None,
+                 target_id),
+            )
+
+    def add_probe_reply(
+        self,
+        *,
+        target_id: int,
+        round_id: int,
+        at: float,
+        source_host: str,
+        source_port: int,
+        xid: int | None,
+        chaddr: str | None,
+        message_type: str | None,
+        server_id: str | None,
+        yiaddr: str | None,
+        router: str | None,
+        verdict: str,
+        reason: str,
+        packet_hex: str,
+        parse_error: str | None,
+    ) -> int:
+        with self._transaction() as conn:
+            cur = conn.execute(
+                "INSERT INTO probe_replies(target_id, round_id, at, source_host, "
+                "source_port, xid, chaddr, message_type, server_id, yiaddr, router, "
+                "verdict, reason, packet_hex, parse_error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    target_id, round_id, at, source_host, source_port, xid, chaddr,
+                    message_type, server_id, yiaddr, router, verdict, reason,
+                    packet_hex, parse_error,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def finish_probe_round(
+        self, round_id: int, *, status: str, reason: str | None
+    ) -> None:
+        with self._transaction() as conn:
+            now = self._clock()
+            conn.execute(
+                "UPDATE probe_rounds SET status = ?, reason = ?, finished_at = ? WHERE id = ?",
+                (status, reason, now, round_id),
+            )
+            # Anything left without a verified answer stays explicitly
+            # unverified; collected evidence is never removed.
+            conn.execute(
+                "UPDATE probe_targets SET state = 'unverified' "
+                "WHERE round_id = ? AND state IN ('pending', 'error')",
+                (round_id,),
+            )
+
+    def list_probe_rounds(self, limit: int = 20) -> list[dict]:
+        limit = max(1, min(int(limit), 100))
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM probe_rounds ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
+            finally:
+                conn.close()
+        return [self._round_row(row) for row in rows]
+
+    @staticmethod
+    def _round_row(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "xid": f"0x{row['xid']:08x}",
+            "xid_int": row["xid"],
+            "mac": row["mac"],
+            "client_key": row["client_key"],
+            "status": row["status"],
+            "reason": row["reason"],
+            "timeout": row["timeout"],
+            "created_at": iso(row["created_at"]),
+            "finished_at": iso(row["finished_at"]) if row["finished_at"] else None,
+        }
+
+    def get_probe_round_detail(self, round_id: int) -> dict | None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                round_row = conn.execute(
+                    "SELECT * FROM probe_rounds WHERE id = ?", (round_id,)
+                ).fetchone()
+                if round_row is None:
+                    return None
+                target_rows = conn.execute(
+                    "SELECT * FROM probe_targets WHERE round_id = ? ORDER BY id",
+                    (round_id,),
+                ).fetchall()
+                reply_rows = conn.execute(
+                    "SELECT * FROM probe_replies WHERE round_id = ? ORDER BY id",
+                    (round_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+        targets = []
+        replies_by_target: dict[int, list[dict]] = {}
+        for row in reply_rows:
+            replies_by_target.setdefault(row["target_id"], []).append(
+                self._reply_row(row)
+            )
+        for row in target_rows:
+            target = self._target_row(row)
+            target["replies"] = replies_by_target.get(row["id"], [])
+            targets.append(target)
+        detail = self._round_row(round_row)
+        detail["targets"] = targets
+        return detail
+
+    @staticmethod
+    def _target_row(row: sqlite3.Row) -> dict:
+        withdrawn = json.loads(row["withdrawn_ips"]) if row["withdrawn_ips"] else []
+        return {
+            "id": row["id"],
+            "endpoint_id": row["endpoint_id"],
+            "name": row["name"],
+            "host": row["host"],
+            "port": row["port"],
+            "trusted": bool(row["trusted"]),
+            "expected_server_id": row["expected_server_id"],
+            "state": row["state"],
+            "withdrawn_ips": withdrawn,
+        }
+
+    @staticmethod
+    def _reply_row(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "at": iso(row["at"]),
+            "source": f"{row['source_host']}:{row['source_port']}",
+            "source_host": row["source_host"],
+            "source_port": row["source_port"],
+            "xid": f"0x{row['xid']:08x}" if row["xid"] is not None else None,
+            "chaddr": row["chaddr"],
+            "message_type": row["message_type"],
+            "server_id": row["server_id"],
+            "yiaddr": row["yiaddr"],
+            "router": row["router"],
+            "verdict": row["verdict"],
+            "reason": row["reason"],
+            "packet_hex": row["packet_hex"],
+            "parse_error": row["parse_error"],
+        }
+
+    def withdraw_probe_offers(self, *, round_id: int, client_key: str, mac: str) -> list[str]:
+        """Delete only this probe round's unconfirmed offers on the local service.
+
+        Bound leases are deliberately excluded: a probe never sends REQUEST, so
+        a bound row for the synthetic identity belongs to a real device's
+        transaction and must not be touched by probe cleanup.
+        """
+        with self._transaction() as conn:
+            now = self._clock()
+            rows = conn.execute(
+                "SELECT ip FROM leases WHERE client_key = ? AND status = 'offered'",
+                (client_key,),
+            ).fetchall()
+            ips = [row["ip"] for row in rows]
+            if ips:
+                conn.execute(
+                    "DELETE FROM leases WHERE client_key = ? AND status = 'offered'",
+                    (client_key,),
+                )
+            for ip in ips:
+                self._log_event(
+                    conn,
+                    now=now,
+                    category="probe",
+                    message_type="PROBE_WITHDRAW",
+                    xid=None,
+                    client_key=client_key,
+                    ip=ip,
+                    detail={"action": "probe-withdraw-offer", "round_id": round_id,
+                            "mac": mac},
+                )
+            return ips

@@ -14,6 +14,17 @@ docker compose up --build -d
 # 打开 http://localhost:8080
 ```
 
+Compose 除本服务外还会启动三个**陌生应答端点**（仅用于演练，不会确认任何租约）：
+
+| 服务 | 宿主 UDP 端口 | 行为 |
+| --- | --- | --- |
+| `rogue-spoof` | `6768` | OFFER 携带**冒用的受信 Server Identifier** `192.0.2.2`，下发陌生网关 `198.51.100.1` |
+| `rogue-late` | `6769` | 延迟 6 秒才应答，演示迟到报文不会混入下一轮 |
+| `rogue-bad-xid` | `6770` | 用错误事务号应答，演示事务/身份核对 |
+
+启动后网页的"定向探测"卡片会通过 `DHCP_PROBE_SEED_ENDPOINTS` 自动登记受信端点与三个
+陌生端点，直接勾选发起即可。
+
 ```bash
 # 查看状态
 curl -s http://localhost:8080/api/health | python3 -m json.tool
@@ -49,6 +60,13 @@ docker compose down -v       # 连租约数据一起清空
 - **并发**：所有分配/确认/释放都在同一把进程内锁 + SQLite 写事务中完成，
   状态表主键为地址，并有"每个客户端最多一条 active 租约"的部分唯一索引兜底。
 - **地址池耗尽**时静默丢弃 DISCOVER（不伪造地址）。
+- **定向探测只发 DISCOVER**：每轮生成独立事务号（XID）与探测设备身份（随机本地管理
+  MAC + Client Identifier），只采信"本轮 XID + 本设备身份"且来源端点匹配的应答。
+  可信度按**应答来源的 UDP 端点**判定：陌生端点即使冒用受信 Server Identifier，也判为
+  `spoofed-identifier`，绝不算受信。轮次结束（完成/取消/超时）后只撤销本轮探测身份在
+  本服务产生的 `offered` 预留；真实设备的 `bound` 租约不会被触碰，探测全程不发
+  REQUEST、不确认租约。每轮使用独立的 UDP 套接字并按来源地址在用户态分发，旧轮套接字
+  关闭后迟到报文无法进入新轮，证据按轮次持久化保留。
 
 支持的消息类型：DISCOVER、REQUEST、RELEASE，另外对 DECLINE 做隔离、对 INFORM 返回
 ACK。中继（giaddr 非零）请求会被忽略——本服务不监听 67/udp。
@@ -69,7 +87,22 @@ ACK。中继（giaddr 非零）请求会被忽略——本服务不监听 67/udp
 | `DHCP_DB_PATH` | `/data/dhcp.sqlite3` | 数据卷内路径 |
 | `DHCP_SIM_TARGET_HOST` / `DHCP_SIM_TARGET_PORT` | `127.0.0.1` / 跟随实际监听端口 | 网页模拟器的发送目标 |
 | `DHCP_SIM_TIMEOUT` | `1.5` | 网页等待响应的秒数 |
+| `DHCP_PROBE_TIMEOUT` | `3.0` | 定向探测每轮等待窗口（秒） |
+| `DHCP_PROBE_MAC_OUI` | `02:50:52` | 探测设备身份使用的本地管理 MAC 前三字节 |
+| `DHCP_PROBE_SEED_ENDPOINTS` | 空 | 启动时自动登记的端点，格式 `名称\|主机\|端口\|受信(0/1)\|Server-ID;...` |
 | `DHCP_ALLOW_FAILURE_INJECTION` | `0`（Compose 里设为 `1`） | 允许演练接口注入一次提交失败 |
+
+### 陌生应答端点（rogue 服务）的环境变量
+
+`app/rogue/server.py` 与主服务同一镜像、不同启动命令，仅应答 DISCOVER：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ROGUE_UDP_HOST` / `ROGUE_UDP_PORT` | `0.0.0.0` / `6768` | 监听地址 |
+| `ROGUE_SERVER_ID` | `198.51.100.2` | Option 54；设成受信值即可模拟冒用 |
+| `ROGUE_OFFER_IP` / `ROGUE_ROUTER` / `ROGUE_DNS` | `198.51.100.230` / `.1` / `.1` | 拟分配地址与陌生网关/DNS |
+| `ROGUE_DELAY_SECONDS` | `0` | 延迟应答秒数，模拟迟到报文 |
+| `ROGUE_REPLY_BAD_XID` | `0` | 置 `1` 时用错误 XID 应答 |
 
 若用不同地址池启动却指向旧数据库，服务会拒绝启动并提示换 `DHCP_DB_PATH`，
 避免把旧租约静默套用到新池。
@@ -82,8 +115,12 @@ ACK。中继（giaddr 非零）请求会被忽略——本服务不监听 67/udp
 - 发送 DHCP 报文：选择 DISCOVER / REQUEST / RELEASE、MAC（可加 Client Identifier）、
   Hostname、Requested IP、ciaddr、Server Identifier、XID；可发往本服务的 UDP
   监听端口，也可自定义主机与端口。发出的报文十六进制与解析后的响应会一并展示。
-- 租约表与事件时间线（OFFER/ACK/NAK/RELEASE/过期/OFFER 过期等），每 10s 自动刷新，
-  另有长轮询在状态变化时立即刷新。
+- 租约表与事件时间线（OFFER/ACK/NAK/RELEASE/过期/OFFER 过期/PROBE_WITHDRAW 等），
+  每 10s 自动刷新，另有长轮询在状态变化时立即刷新。
+- 定向探测：登记/删除受信与待核查 UDP 端点（名称、主机、端口、是否受信、登记
+  Server Identifier），勾选端点发起真实 DISCOVER。结果按端点展示应答来源、报文类型、
+  Server Identifier、拟分配地址、网关、判定（受信 / 非授权 / 冒用标识 / 身份不符 /
+  未核实）与判定依据；进行中的轮次可取消，已收证据保留，未应答端点标记为未核实。
 
 注意：网页发送的是**真实 DHCP 报文**，会占用/释放本服务的地址，但它不会修改运行
 浏览器那台机器的网卡配置——这里演练的是服务端协议与租约逻辑。
@@ -97,6 +134,7 @@ python3 scripts/drill.py contend          # 归属、冒领 NAK、续租、释�
 python3 scripts/drill.py race --clients 20  # 并发争抢（超出池容量也应静默且无重复）
 python3 scripts/drill.py expire           # 等 OFFER 过期后回收、旧预留不能再确认
 python3 scripts/drill.py simulate         # 通过网页 API 发真实报文
+python3 scripts/drill.py probe            # 定向探测：冒用标识/迟到/错事务号/轮次隔离
 python3 scripts/drill.py commit-failure   # 注入提交失败：必须不 ACK，重试后恢复
 
 # 重启演练（两步之间执行 docker compose restart dhcp）
@@ -127,7 +165,9 @@ python3 -m unittest discover -s tests -v
 覆盖：报文编解码、OFFER 占用与过期、越权 REQUEST/续租/RELEASE、其他服务器选择、
 重传幂等、并发争抢（线程屏障同时 DISCOVER / 同一客户端并发）、池耗尽、重启后租约
 存活与不可抢占、第二实例锁、提交失败不发 ACK 且状态未污染、真实 UDP 往返、
-网页 API 与过期回收。
+网页 API 与过期回收、定向探测判定矩阵（受信/非授权/冒用标识/身份不符/非 OFFER）、
+错事务号不计为应答、静默与超时端点标记未核实且证据保留、迟到应答不混入下一轮、
+取消轮次保留证据、探测预留撤销且真实设备 bound 租约不受影响、端点登记 CRUD 与种子。
 
 ## 已知限制
 

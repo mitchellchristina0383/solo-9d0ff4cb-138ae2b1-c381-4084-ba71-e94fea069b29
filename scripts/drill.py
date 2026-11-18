@@ -435,6 +435,125 @@ def scenario_simulate(lab: Lab) -> None:
     print(f"  示例响应: {json.dumps(data['reply'], ensure_ascii=False)[:220]}…")
 
 
+def _api_call(lab: Lab, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(
+        lab.api + path, data=data,
+        headers={"Content-Type": "application/json"}, method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = response.read()
+            return response.status, json.loads(payload) if payload else {}
+    except urllib.error.HTTPError as exc:
+        payload = exc.read()
+        return exc.code, json.loads(payload) if payload else {}
+
+
+def _ensure_endpoint(lab: Lab, spec: dict) -> dict:
+    _status, listing = _api_call(lab, "GET", "/api/probe/endpoints")
+    for endpoint in listing.get("endpoints", []):
+        if (endpoint["host"] == spec["host"] and endpoint["port"] == spec["port"]
+                and endpoint["name"] == spec["name"]):
+            return endpoint
+    status, created = _api_call(lab, "POST", "/api/probe/endpoints", spec)
+    check(status == 201, f"登记端点 {spec['name']} ({spec['host']}:{spec['port']})")
+    return created
+
+
+def scenario_probe(lab: Lab) -> None:
+    print("== 定向探测：冒用标识 / 迟到应答 / 错事务号 ==")
+    lab.wait_health()
+    server_id = lab.server_id()
+    specs = [
+        {"name": "drill-受信", "host": lab.host, "port": lab.port,
+         "trusted": True, "expected_server_id": server_id},
+        {"name": "drill-冒名", "host": lab.host, "port": 6768,
+         "trusted": False, "expected_server_id": server_id},
+        {"name": "drill-迟到", "host": lab.host, "port": 6769,
+         "trusted": False, "expected_server_id": server_id},
+        {"name": "drill-错事务号", "host": lab.host, "port": 6770,
+         "trusted": False, "expected_server_id": server_id},
+    ]
+    endpoints = [_ensure_endpoint(lab, spec) for spec in specs]
+    ids = [endpoint["id"] for endpoint in endpoints]
+
+    used_before = lab.state()["stats"]["used"]
+    status, started = _api_call(
+        lab, "POST", "/api/probe/rounds", {"endpoint_ids": ids}
+    )
+    check(status == 201, "探测轮次已发起")
+    round_id = started["id"]
+    first_xid, first_mac = started["xid"], started["mac"]
+
+    deadline = time.time() + 12
+    detail: dict = {}
+    while time.time() < deadline:
+        status, detail = _api_call(lab, "GET", f"/api/probe/rounds/{round_id}")
+        if detail.get("status") != "running":
+            break
+        time.sleep(0.3)
+    check(detail.get("status") in ("completed", "timeout", "cancelled"),
+          f"轮次已结束（状态: {detail.get('status')}）")
+
+    by_name = {t["name"]: t for t in detail["targets"]}
+    verdicts = {
+        name: [r["verdict"] for r in target["replies"]]
+        for name, target in by_name.items()
+    }
+    check(verdicts.get("drill-受信") == ["trusted"], "受信端点判定为受信")
+    check(verdicts.get("drill-冒名") == ["spoofed-identifier"],
+          "冒用受信 Server Identifier 的陌生端点仍判定为冒用，不算受信")
+    spoof_reply = by_name["drill-冒名"]["replies"][0]
+    check(spoof_reply["server_id"] == server_id, "冒用应答确实携带受信标识")
+    check(spoof_reply["router"] == "198.51.100.1", "证据保留陌生网关地址")
+    check(by_name["drill-迟到"]["state"] == "unverified",
+          "迟到端点在窗口内标记为未核实")
+    check(by_name["drill-迟到"]["replies"] == [], "迟到应答未进入本轮证据")
+    check(verdicts.get("drill-错事务号") == ["identity-mismatch"],
+          "错事务号应答保留为身份不符证据，且不计为有效应答")
+    check(by_name["drill-错事务号"]["state"] == "unverified",
+          "身份不符的端点保持未核实")
+
+    # Wait out the 6s delayed responder, then start a new round.
+    print("  等待迟到应答越过旧轮窗口（约 7s）…")
+    time.sleep(7.0)
+    status, second = _api_call(
+        lab, "POST", "/api/probe/rounds", {"endpoint_ids": ids[:2]}
+    )
+    check(status == 201, "第二轮探测已发起")
+    check(second["xid"] != first_xid and second["mac"] != first_mac,
+          "每轮使用独立事务号与探测身份")
+    deadline = time.time() + 10
+    detail2: dict = {}
+    while time.time() < deadline:
+        status, detail2 = _api_call(lab, "GET", f"/api/probe/rounds/{second['id']}")
+        if detail2.get("status") != "running":
+            break
+        time.sleep(0.3)
+    leaked = [
+        r for t in detail2["targets"] for r in t["replies"]
+        if r["xid"] == first_xid
+    ]
+    check(leaked == [], "旧轮迟到应答没有混入新一轮")
+
+    # Probes never confirm leases; their offers are withdrawn at round end.
+    check(wait_until(
+        lambda: lab.state()["stats"]["used"] == used_before, 8
+    ), "探测结束后本服务地址池恢复原状（OFFER 预留已撤销）")
+    leases = lab.state()["leases"]
+    check(
+        all(l["client_mac"] != first_mac and l["client_mac"] != second["mac"]
+            for l in leases),
+        "两轮探测身份均未留下任何预留或租约",
+    )
+    print("  探测证据示例:")
+    for target in detail["targets"]:
+        for reply in target["replies"]:
+            print(f"    {target['name']}: {reply['verdict']} <- {reply['source']} "
+                  f"SID={reply['server_id']} yiaddr={reply['yiaddr']}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -449,6 +568,7 @@ def main() -> None:
     race.add_argument("--clients", type=int, default=12)
     sub.add_parser("expire")
     sub.add_parser("simulate")
+    sub.add_parser("probe")
     sub.add_parser("restart-before")
     sub.add_parser("restart-after")
     sub.add_parser("commit-failure")
@@ -463,6 +583,8 @@ def main() -> None:
         scenario_expire(lab)
     elif args.scenario == "simulate":
         scenario_simulate(lab)
+    elif args.scenario == "probe":
+        scenario_probe(lab)
     elif args.scenario == "restart-before":
         scenario_restart_before(lab, args.state)
     elif args.scenario == "restart-after":

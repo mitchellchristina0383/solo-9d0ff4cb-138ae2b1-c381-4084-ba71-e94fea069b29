@@ -61,6 +61,14 @@ class Settings:
     # 0 means "follow the port the UDP listener actually bound".
     sim_target_port: int = 0
     sim_timeout: float = 1.5
+    # Directed rogue-DHCP probe settings.
+    probe_timeout: float = 3.0
+    # Locally administered OUI (first three octets) for synthetic probe
+    # identities; the remaining octets are randomised per round.
+    probe_mac_oui: str = "02:50:52"
+    # Raw seed list, parsed at startup:
+    # "name|host|port|trusted(0/1)|server-id;name|host|port|0|"
+    probe_seed_endpoints: str = ""
     # Off by default. When enabled, the web API exposes a drill-only endpoint
     # that makes the next lease commit fail, to demonstrate the no-ACK rule.
     allow_failure_injection: bool = False
@@ -94,6 +102,21 @@ class Settings:
             raise ValueError("UDP ports must be in 0..65535")
         if self.sim_timeout <= 0:
             raise ValueError("DHCP_SIM_TIMEOUT must be > 0")
+        if self.probe_timeout <= 0:
+            raise ValueError("DHCP_PROBE_TIMEOUT must be > 0")
+        try:
+            oui_parts = self.probe_mac_oui.split(":")
+            if len(oui_parts) != 3 or any(
+                len(part) != 2
+                or any(c not in "0123456789abcdefABCDEF" for c in part)
+                for part in oui_parts
+            ):
+                raise ValueError
+            int(self.probe_mac_oui.replace(":", ""), 16)
+        except ValueError as exc:
+            raise ValueError(
+                f"DHCP_PROBE_MAC_OUI must be three hex octets, got {self.probe_mac_oui!r}"
+            ) from exc
 
     def pool_ips(self) -> tuple[ipaddress.IPv4Address, ...]:
         return tuple(
@@ -144,6 +167,9 @@ class Settings:
             # 0 means "whatever UDP port the listener actually bound".
             sim_target_port=_env_int("DHCP_SIM_TARGET_PORT", 0),
             sim_timeout=_env_float("DHCP_SIM_TIMEOUT", 1.5),
+            probe_timeout=_env_float("DHCP_PROBE_TIMEOUT", 3.0),
+            probe_mac_oui=_env("DHCP_PROBE_MAC_OUI", "02:50:52"),
+            probe_seed_endpoints=_env("DHCP_PROBE_SEED_ENDPOINTS", ""),
             allow_failure_injection=_env(
                 "DHCP_ALLOW_FAILURE_INJECTION", "0"
             ).lower()
